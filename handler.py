@@ -182,10 +182,9 @@ def manage_lora(is_lightning):
     global pipe_edit, current_lora_state
     if is_lightning and current_lora_state != "lightning":
         pipe_edit.load_lora_weights("lightx2v/Qwen-Image-Edit-2511-Lightning", weight_name="Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors", cache_dir=MODELS_DIR, local_files_only=True)
-        # Fuse skipped to prevent CUDA/Kernel errors
         current_lora_state = "lightning"
     elif not is_lightning and current_lora_state == "lightning":
-        # pipe_edit.unfuse_lora() # Not needed if not fused
+
         pipe_edit.unload_lora_weights()
         current_lora_state = "none"
 
