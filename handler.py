@@ -13,6 +13,9 @@ from diffusers import FlowMatchEulerDiscreteScheduler, QwenImageEditPipeline, Qw
 
 MODELS_DIR = "/home/user/app/models"
 pipe_edit = None
+pipe_layer = None
+model_vl = None
+processor_vl = None
 current_lora_state = "none"
 
 SYSTEM_PROMPT = '''
@@ -141,6 +144,7 @@ def load_edit_model():
     current_lora_state = "none"
 
 def polish_prompt_local(original_prompt, pil_images):
+    # Lazy load VLM to save VRAM
     device, dtype = "cuda", torch.bfloat16
     try:
         model_vl = Qwen3VLForConditionalGeneration.from_pretrained(
@@ -162,6 +166,7 @@ def polish_prompt_local(original_prompt, pil_images):
         generated_ids_trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
         output_text = processor_vl.batch_decode(generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         
+        # Cleanup VLM
         del model_vl
         del processor_vl
         flush()
@@ -183,15 +188,14 @@ def manage_lora(is_lightning):
     
     if is_lightning and current_lora_state != "lightning":
         pipe_edit.load_lora_weights(
-            "lightx2v/Qwen-Image-Lightning", 
-            weight_name="Qwen-Image-Lightning-8steps-V1.0-bf16.safetensors", 
+            "lightx2v/Qwen-Image-Edit-2511-Lightning", 
+            weight_name="Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors", 
             cache_dir=MODELS_DIR, 
             local_files_only=True
         )
-        pipe_edit.fuse_lora()
+        # Fuse is skipped to prevent CUDA Kernel crash on PyTorch 2.5
         current_lora_state = "lightning"
     elif not is_lightning and current_lora_state == "lightning":
-        pipe_edit.unfuse_lora()
         pipe_edit.unload_lora_weights()
         current_lora_state = "none"
 
@@ -239,31 +243,29 @@ def handler(job):
     if not images_b64: return {"error": "No image provided"}
     
     pil_images = [base64_to_pil(i) for i in images_b64]
+    
+    # Resize 1MP
     for i in range(len(pil_images)):
         w, h = get_1mp_dimensions(pil_images[i].width, pil_images[i].height)
         pil_images[i] = pil_images[i].resize((w, h), Image.LANCZOS)
 
     prompt = job_input.get('prompt', "edit")
-    
     if job_input.get('rewrite_prompt', False):
         prompt = polish_prompt_local(prompt, pil_images)
 
     target_w, target_h = pil_images[0].size
     
     steps = job_input.get('num_inference_steps', 4)
-    use_lightning = job_input.get('use_lightning', True) or (steps <= 8)
+    use_lightning = job_input.get('use_lightning', True) and (steps <= 8)
     manage_lora(use_lightning)
     
-    default_guidance = 2.5 if use_lightning else 4.0
-    cfg = float(job_input.get('true_guidance_scale', default_guidance))
-
     with torch.inference_mode():
         output = pipe_edit(
             image=pil_images,
             prompt=prompt,
             negative_prompt=job_input.get('negative_prompt', " "),
             num_inference_steps=steps,
-            guidance_scale=cfg,
+            guidance_scale=job_input.get('true_guidance_scale', 1.0 if use_lightning else 4.0),
             generator=torch.Generator("cuda").manual_seed(job_input.get('seed', 42)),
             height=target_h,
             width=target_w

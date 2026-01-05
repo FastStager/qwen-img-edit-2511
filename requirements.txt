@@ -1,8 +1,9 @@
 git+https://github.com/huggingface/diffusers.git
-transformers>=4.48.0
+transformers>=4.49.0
 accelerate
 safetensors
 sentencepiece
+torchvision
 peft
 runpod
 qwen_vl_utils
