@@ -7,14 +7,12 @@ import io
 import math
 import json
 import os
+import gc
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 from diffusers import FlowMatchEulerDiscreteScheduler, QwenImageEditPipeline, QwenImageLayeredPipeline
 
 MODELS_DIR = "/home/user/app/models"
 pipe_edit = None
-pipe_layer = None
-model_vl = None
-processor_vl = None
 current_lora_state = "none"
 
 SYSTEM_PROMPT = '''
@@ -97,6 +95,10 @@ Please strictly follow the rewriting rules below:
 }
 '''
 
+def flush():
+    gc.collect()
+    torch.cuda.empty_cache()
+
 def get_1mp_dimensions(width, height):
     target_area = 1024 * 1024
     aspect = width / height
@@ -106,19 +108,10 @@ def get_1mp_dimensions(width, height):
     new_h = int(round(new_h / 64) * 64)
     return new_w, new_h
 
-def load_models():
-    global pipe_edit, pipe_layer, model_vl, processor_vl, current_lora_state
+def load_edit_model():
+    global pipe_edit, current_lora_state
     device, dtype = "cuda", torch.bfloat16
     
-    model_vl = Qwen3VLForConditionalGeneration.from_pretrained(
-        "Qwen/Qwen3-VL-8B-Instruct", 
-        torch_dtype=dtype, 
-        device_map="auto", 
-        cache_dir=MODELS_DIR, 
-        local_files_only=True
-    )
-    processor_vl = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-8B-Instruct", cache_dir=MODELS_DIR)
-
     scheduler_config = {
         "base_image_seq_len": 256, 
         "base_shift": math.log(3), 
@@ -144,19 +137,21 @@ def load_models():
         cache_dir=MODELS_DIR, 
         local_files_only=True
     ).to(device)
-
-    pipe_layer = QwenImageLayeredPipeline.from_pretrained(
-        "Qwen/Qwen-Image-Edit-2511", 
-        torch_dtype=dtype, 
-        cache_dir=MODELS_DIR, 
-        local_files_only=True
-    ).to(device)
     
     current_lora_state = "none"
 
 def polish_prompt_local(original_prompt, pil_images):
-    global model_vl, processor_vl
+    device, dtype = "cuda", torch.bfloat16
     try:
+        model_vl = Qwen3VLForConditionalGeneration.from_pretrained(
+            "Qwen/Qwen3-VL-8B-Instruct", 
+            torch_dtype=dtype, 
+            device_map="auto", 
+            cache_dir=MODELS_DIR, 
+            local_files_only=True
+        )
+        processor_vl = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-8B-Instruct", cache_dir=MODELS_DIR)
+
         content = [{"type": "text", "text": f"{SYSTEM_PROMPT}\n\nUser Input: {original_prompt}\n\nRewritten Prompt:"}]
         for img in pil_images:
             content.append({"type": "image", "image": img})
@@ -167,24 +162,36 @@ def polish_prompt_local(original_prompt, pil_images):
         generated_ids_trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
         output_text = processor_vl.batch_decode(generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         
+        del model_vl
+        del processor_vl
+        flush()
+
         if '"Rewritten"' in output_text:
             try:
                 start = output_text.find('{')
                 end = output_text.rfind('}') + 1
-                return json.loads(output_text[start:end])
+                res_json = json.loads(output_text[start:end])
                 return res_json.get('Rewritten', original_prompt)
             except: pass
         return output_text.strip().replace("```json", "").replace("```", "").replace("\n", " ")
     except Exception:
+        flush()
         return original_prompt
 
 def manage_lora(is_lightning):
     global pipe_edit, current_lora_state
+    
     if is_lightning and current_lora_state != "lightning":
-        pipe_edit.load_lora_weights("lightx2v/Qwen-Image-Edit-2511-Lightning", weight_name="Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors", cache_dir=MODELS_DIR, local_files_only=True)
+        pipe_edit.load_lora_weights(
+            "lightx2v/Qwen-Image-Lightning", 
+            weight_name="Qwen-Image-Lightning-8steps-V1.0-bf16.safetensors", 
+            cache_dir=MODELS_DIR, 
+            local_files_only=True
+        )
+        pipe_edit.fuse_lora()
         current_lora_state = "lightning"
     elif not is_lightning and current_lora_state == "lightning":
-
+        pipe_edit.unfuse_lora()
         pipe_edit.unload_lora_weights()
         current_lora_state = "none"
 
@@ -195,45 +202,68 @@ def pil_to_base64(img):
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 def handler(job):
-    global pipe_edit, pipe_layer
-    if pipe_edit is None: load_models()
+    global pipe_edit
+    if pipe_edit is None: load_edit_model()
     job_input = job.get('input', {})
 
     if job_input.get('get_layers', False):
-        raw_img = job_input.get('image') or (job_input.get('images', [None])[0])
-        if not raw_img: return {"error": "No image provided"}
-        img = base64_to_pil(raw_img).convert("RGBA")
-        output = pipe_layer(image=img, prompt=job_input.get('prompt', ""), layers=job_input.get('layers', 4), num_inference_steps=50, generator=torch.Generator("cuda").manual_seed(job_input.get('seed', 42)))
-        return {"layers": [pil_to_base64(l) for l in output.images[0]]}
+        try:
+            device, dtype = "cuda", torch.bfloat16
+            pipe_layer = QwenImageLayeredPipeline.from_pretrained(
+                "Qwen/Qwen-Image-Edit-2511", 
+                torch_dtype=dtype, 
+                cache_dir=MODELS_DIR, 
+                local_files_only=True
+            ).to(device)
+            
+            raw_img = job_input.get('image') or (job_input.get('images', [None])[0])
+            if not raw_img: return {"error": "No image provided"}
+            img = base64_to_pil(raw_img).convert("RGBA")
+            output = pipe_layer(
+                image=img, 
+                prompt=job_input.get('prompt', ""), 
+                layers=job_input.get('layers', 4), 
+                num_inference_steps=50, 
+                generator=torch.Generator("cuda").manual_seed(job_input.get('seed', 42))
+            )
+            
+            del pipe_layer
+            flush()
+            return {"layers": [pil_to_base64(l) for l in output.images[0]]}
+        except Exception as e:
+            flush()
+            return {"error": str(e)}
 
     images_b64 = job_input.get('images', [])
     if not images_b64 and job_input.get('image'): images_b64 = [job_input.get('image')]
     if not images_b64: return {"error": "No image provided"}
     
     pil_images = [base64_to_pil(i) for i in images_b64]
-    
-    # Resize input (1MP)
     for i in range(len(pil_images)):
         w, h = get_1mp_dimensions(pil_images[i].width, pil_images[i].height)
         pil_images[i] = pil_images[i].resize((w, h), Image.LANCZOS)
 
     prompt = job_input.get('prompt', "edit")
+    
     if job_input.get('rewrite_prompt', False):
         prompt = polish_prompt_local(prompt, pil_images)
 
     target_w, target_h = pil_images[0].size
     
     steps = job_input.get('num_inference_steps', 4)
-    use_lightning = job_input.get('use_lightning', True) and (steps <= 8)
+    use_lightning = job_input.get('use_lightning', True) or (steps <= 8)
     manage_lora(use_lightning)
     
+    default_guidance = 2.5 if use_lightning else 4.0
+    cfg = float(job_input.get('true_guidance_scale', default_guidance))
+
     with torch.inference_mode():
         output = pipe_edit(
             image=pil_images,
             prompt=prompt,
             negative_prompt=job_input.get('negative_prompt', " "),
             num_inference_steps=steps,
-            guidance_scale=job_input.get('true_guidance_scale', 1.0 if use_lightning else 4.0),
+            guidance_scale=cfg,
             generator=torch.Generator("cuda").manual_seed(job_input.get('seed', 42)),
             height=target_h,
             width=target_w
