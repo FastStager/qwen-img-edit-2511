@@ -9,11 +9,10 @@ import json
 import os
 import gc
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
-from diffusers import FlowMatchEulerDiscreteScheduler, QwenImageEditPipeline, QwenImageLayeredPipeline
+from diffusers import FlowMatchEulerDiscreteScheduler, QwenImageEditPipeline
 
 MODELS_DIR = "/home/user/app/models"
 pipe_edit = None
-pipe_layer = None
 model_vl = None
 processor_vl = None
 current_lora_state = "none"
@@ -209,34 +208,6 @@ def handler(job):
     if pipe_edit is None: load_edit_model()
     job_input = job.get('input', {})
 
-    if job_input.get('get_layers', False):
-        try:
-            device, dtype = "cuda", torch.bfloat16
-            pipe_layer = QwenImageLayeredPipeline.from_pretrained(
-                "Qwen/Qwen-Image-Edit-2511", 
-                torch_dtype=dtype, 
-                cache_dir=MODELS_DIR, 
-                local_files_only=True
-            ).to(device)
-            
-            raw_img = job_input.get('image') or (job_input.get('images', [None])[0])
-            if not raw_img: return {"error": "No image provided"}
-            img = base64_to_pil(raw_img).convert("RGBA")
-            output = pipe_layer(
-                image=img, 
-                prompt=job_input.get('prompt', ""), 
-                layers=job_input.get('layers', 4), 
-                num_inference_steps=50, 
-                generator=torch.Generator("cuda").manual_seed(job_input.get('seed', 42))
-            )
-            
-            del pipe_layer
-            flush()
-            return {"layers": [pil_to_base64(l) for l in output.images[0]]}
-        except Exception as e:
-            flush()
-            return {"error": str(e)}
-
     images_b64 = job_input.get('images', [])
     if not images_b64 and job_input.get('image'): images_b64 = [job_input.get('image')]
     if not images_b64: return {"error": "No image provided"}
@@ -256,13 +227,16 @@ def handler(job):
     use_lightning = job_input.get('use_lightning', True) and (steps <= 8)
     manage_lora(use_lightning)
     
+    default_cfg = 1.0 if use_lightning else 4.0
+    cfg = float(job_input.get('true_guidance_scale', default_cfg))
+
     with torch.inference_mode():
         output = pipe_edit(
             image=pil_images,
             prompt=prompt,
             negative_prompt=job_input.get('negative_prompt', " "),
             num_inference_steps=steps,
-            guidance_scale=job_input.get('true_guidance_scale', 1.0 if use_lightning else 4.0),
+            guidance_scale=cfg,
             generator=torch.Generator("cuda").manual_seed(job_input.get('seed', 42)),
             height=target_h,
             width=target_w
