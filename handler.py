@@ -13,6 +13,9 @@ from diffusers import FlowMatchEulerDiscreteScheduler, QwenImageEditPipeline, Qw
 
 MODELS_DIR = "/home/user/app/models"
 pipe_edit = None
+pipe_layer = None
+model_vl = None
+processor_vl = None
 current_lora_state = "none"
 
 SYSTEM_PROMPT = '''
@@ -135,7 +138,7 @@ def load_edit_model():
         scheduler=scheduler, 
         torch_dtype=dtype, 
         cache_dir=MODELS_DIR, 
-        local_files_only=True 
+        local_files_only=True
     ).to(device)
     
     current_lora_state = "none"
@@ -143,12 +146,12 @@ def load_edit_model():
 def polish_prompt_local(original_prompt, pil_images):
     device, dtype = "cuda", torch.bfloat16
     try:
-        print("Loading Qwen3-VL (This may download if not cached)...")
         model_vl = Qwen3VLForConditionalGeneration.from_pretrained(
             "Qwen/Qwen3-VL-8B-Instruct", 
             torch_dtype=dtype, 
             device_map="auto", 
-            cache_dir=MODELS_DIR 
+            cache_dir=MODELS_DIR, 
+            local_files_only=True
         )
         processor_vl = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-8B-Instruct", cache_dir=MODELS_DIR)
 
@@ -174,8 +177,7 @@ def polish_prompt_local(original_prompt, pil_images):
                 return res_json.get('Rewritten', original_prompt)
             except: pass
         return output_text.strip().replace("```json", "").replace("```", "").replace("\n", " ")
-    except Exception as e:
-        print(f"Rewriter failed: {e}")
+    except Exception:
         flush()
         return original_prompt
 
@@ -189,8 +191,10 @@ def manage_lora(is_lightning):
             cache_dir=MODELS_DIR, 
             local_files_only=True
         )
+        pipe_edit.fuse_lora()
         current_lora_state = "lightning"
     elif not is_lightning and current_lora_state == "lightning":
+        pipe_edit.unfuse_lora()
         pipe_edit.unload_lora_weights()
         current_lora_state = "none"
 
@@ -238,13 +242,11 @@ def handler(job):
     if not images_b64: return {"error": "No image provided"}
     
     pil_images = [base64_to_pil(i) for i in images_b64]
-    
     for i in range(len(pil_images)):
         w, h = get_1mp_dimensions(pil_images[i].width, pil_images[i].height)
         pil_images[i] = pil_images[i].resize((w, h), Image.LANCZOS)
 
     prompt = job_input.get('prompt', "edit")
-    
     if job_input.get('rewrite_prompt', False):
         prompt = polish_prompt_local(prompt, pil_images)
 
