@@ -9,7 +9,8 @@ import json
 import os
 import gc
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
-from diffusers import FlowMatchEulerDiscreteScheduler, QwenImageEditPipeline
+from diffusers import FlowMatchEulerDiscreteScheduler
+from qwenimage.pipeline_qwenimage_edit_plus import QwenImageEditPlusPipeline
 
 MODELS_DIR = "/home/user/app/models"
 pipe_edit = None
@@ -132,7 +133,7 @@ def load_edit_model():
     }
     scheduler = FlowMatchEulerDiscreteScheduler.from_config(scheduler_config)
 
-    pipe_edit = QwenImageEditPipeline.from_pretrained(
+    pipe_edit = QwenImageEditPlusPipeline.from_pretrained(
         "Qwen/Qwen-Image-Edit-2511", 
         scheduler=scheduler, 
         torch_dtype=dtype, 
@@ -180,39 +181,22 @@ def polish_prompt_local(original_prompt, pil_images):
         flush()
         return original_prompt
 
-def manage_lora(steps):
+def manage_lora(is_lightning):
     global pipe_edit, current_lora_state
     
-    if steps <= 4:
-        target_state = "lightning_4step"
-    elif steps <= 12:
-        target_state = "lightning_8step"
-    else:
-        target_state = "full"
-
-    if current_lora_state == target_state:
-        return
-
-    if current_lora_state != "none":
-        pipe_edit.unfuse_lora()
-        pipe_edit.unload_lora_weights()
-    
-    if target_state == "lightning_4step":
+    if is_lightning and current_lora_state != "lightning":
         pipe_edit.load_lora_weights(
             "lightx2v/Qwen-Image-Edit-2511-Lightning", 
             weight_name="Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors", 
             cache_dir=MODELS_DIR, 
             local_files_only=True
         )
-    elif target_state == "lightning_8step":
-        pipe_edit.load_lora_weights(
-            "lightx2v/Qwen-Image-Lightning", 
-            weight_name="Qwen-Image-Lightning-8steps-V1.0-bf16.safetensors", 
-            cache_dir=MODELS_DIR, 
-            local_files_only=True
-        )
-        
-    current_lora_state = target_state
+        pipe_edit.fuse_lora()
+        current_lora_state = "lightning"
+    elif not is_lightning and current_lora_state == "lightning":
+        pipe_edit.unfuse_lora()
+        pipe_edit.unload_lora_weights()
+        current_lora_state = "none"
 
 def base64_to_pil(b64): return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
 def pil_to_base64(img):
@@ -231,39 +215,34 @@ def handler(job):
     
     pil_images = [base64_to_pil(i) for i in images_b64]
     
+    target_w, target_h = get_1mp_dimensions(pil_images[0].width, pil_images[0].height)
+    if job_input.get('height') and job_input.get('width'):
+        target_h = (int(job_input['height']) // 64) * 64
+        target_w = (int(job_input['width']) // 64) * 64
+
     for i in range(len(pil_images)):
-        w, h = get_1mp_dimensions(pil_images[i].width, pil_images[i].height)
-        pil_images[i] = pil_images[i].resize((w, h), Image.LANCZOS)
+        pil_images[i] = pil_images[i].resize((target_w, target_h), Image.LANCZOS)
 
     prompt = job_input.get('prompt', "edit")
     if job_input.get('rewrite_prompt', False):
         prompt = polish_prompt_local(prompt, pil_images)
-
-    target_w, target_h = pil_images[0].size
     
     steps = job_input.get('num_inference_steps', 4)
-    use_lightning = job_input.get('use_lightning', True)
+    use_lightning = job_input.get('use_lightning', True) and (steps <= 8)
+    manage_lora(use_lightning)
     
-    if use_lightning:
-        manage_lora(steps)
-    else:
-        manage_lora(999) 
-    
-    if current_lora_state == "lightning_4step":
-        default_cfg = 1.0
-    elif current_lora_state == "lightning_8step":
-        default_cfg = 2.5
-    else:
-        default_cfg = 4.0
-        
+    default_cfg = 1.0 if use_lightning else 4.0
     cfg = float(job_input.get('true_guidance_scale', default_cfg))
+
+    batch_prompts = [prompt] * len(pil_images)
 
     with torch.inference_mode():
         output = pipe_edit(
             image=pil_images,
-            prompt=prompt,
-            negative_prompt=job_input.get('negative_prompt', " "),
+            prompt=batch_prompts,
+            negative_prompt=[job_input.get('negative_prompt', " ")] * len(pil_images),
             num_inference_steps=steps,
+            true_cfg_scale=cfg,
             guidance_scale=cfg,
             generator=torch.Generator("cuda").manual_seed(job_input.get('seed', 42)),
             height=target_h,

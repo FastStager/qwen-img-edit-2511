@@ -5,21 +5,31 @@ import math
 import json
 import gc
 import os
+import sys
+
+IMAGE_PATH = "/workspace/image14.png"
+OUTPUT_PATH = "output_plus_test.png"
+RAW_PROMPT = "Add furnishings and accessories to this room as an interior designer would do for a real estate staging. The generated image shall have the exact same dimensions as the original image and architectural details. Respect doorways and windows and make sure they are consistent with the source image and not blocked by furniture. Use cute accessories and with appropriate wall space, add smart simple graphic paintings. Use neutral colors with light colored accents to match the colors of the room. Give the area an attractive glow."
+USE_REWRITER = False  
+SEED = 42
+STEPS = 4
+CFG = 1.0
+try:
+    from qwenimage.pipeline_qwenimage_edit_plus import QwenImageEditPlusPipeline
+except ImportError:
+    try:
+        from diffusers import QwenImageEditPlusPipeline
+    except ImportError:
+        print("CRITICAL ERROR: Could not import 'QwenImageEditPlusPipeline'.")
+        print("Ensure the 'qwenimage' folder is in this directory.")
+        exit(1)
 
 try:
     from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
-    from diffusers import FlowMatchEulerDiscreteScheduler, QwenImageEditPipeline
+    from diffusers import FlowMatchEulerDiscreteScheduler
 except ImportError:
-    print("Missing libs.")
+    print("Missing libs. Run: pip install torch torchvision diffusers transformers accelerate safetensors sentencepiece peft qwen_vl_utils protobuf")
     exit(1)
-
-IMAGE_PATH = "/home/imag8.png"
-OUTPUT_PATH = "output_4step_test.png"
-RAW_PROMPT = "Add furnishings and accessories to this room as an interior designer would do for a real estate staging."
-USE_REWRITER = False  
-SEED = 42
-STEPS = 4  
-CFG = 1.0  
 
 SYSTEM_PROMPT = '''
 # Edit Instruction Rewriter
@@ -102,6 +112,7 @@ Please strictly follow the rewriting rules below:
 '''
 
 def get_1mp_dimensions(width, height):
+    """Calculates 1MP dimensions (1024x1024 equivalent), snapped to 64px."""
     target_area = 1024 * 1024
     aspect = width / height
     new_w = math.sqrt(target_area * aspect)
@@ -116,15 +127,16 @@ def flush():
 
 def main():
     dtype = torch.bfloat16
-    print(f"Running Local Verification (Low-RAM Mode)")
+    print(f"Running Local Verification (Plus Pipeline).")
 
     if not os.path.exists(IMAGE_PATH):
         print(f"Error: Image not found at {IMAGE_PATH}")
         return
         
     original_image = Image.open(IMAGE_PATH).convert("RGB")
+    
     w, h = get_1mp_dimensions(original_image.width, original_image.height)
-    print(f"Resizing input to {w}x{h} (1MP target)")
+    print(f"Resizing input to {w}x{h}")
     pil_image = original_image.resize((w, h), Image.LANCZOS)
 
     final_prompt = RAW_PROMPT
@@ -186,7 +198,7 @@ def main():
     }
     scheduler = FlowMatchEulerDiscreteScheduler.from_config(scheduler_config)
 
-    pipe = QwenImageEditPipeline.from_pretrained(
+    pipe = QwenImageEditPlusPipeline.from_pretrained(
         "Qwen/Qwen-Image-Edit-2511",
         scheduler=scheduler,
         torch_dtype=dtype,
@@ -198,17 +210,24 @@ def main():
         "lightx2v/Qwen-Image-Edit-2511-Lightning", 
         weight_name="Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors"
     )
+    
+    try:
+        pipe.fuse_lora()
+    except Exception as e:
+        print(f"Fusion skipped (Low RAM): {e}")
 
     print("Enabling CPU Offload...")
     pipe.enable_model_cpu_offload()
 
     print(f"Running Inference (Seed: {SEED})...")
+    
     output = pipe(
         image=[pil_image],
         prompt=final_prompt,
         negative_prompt=" ",
         num_inference_steps=STEPS,
-        guidance_scale=CFG, 
+        true_cfg_scale=CFG,        
+        guidance_scale=CFG,        
         generator=torch.Generator("cuda").manual_seed(SEED),
         height=h,
         width=w
