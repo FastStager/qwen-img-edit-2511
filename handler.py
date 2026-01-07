@@ -180,22 +180,39 @@ def polish_prompt_local(original_prompt, pil_images):
         flush()
         return original_prompt
 
-def manage_lora(is_lightning):
+def manage_lora(steps):
     global pipe_edit, current_lora_state
     
-    if is_lightning and current_lora_state != "lightning":
+    if steps <= 4:
+        target_state = "lightning_4step"
+    elif steps <= 12:
+        target_state = "lightning_8step"
+    else:
+        target_state = "full"
+
+    if current_lora_state == target_state:
+        return
+
+    if current_lora_state != "none":
+        pipe_edit.unfuse_lora()
+        pipe_edit.unload_lora_weights()
+    
+    if target_state == "lightning_4step":
         pipe_edit.load_lora_weights(
             "lightx2v/Qwen-Image-Edit-2511-Lightning", 
             weight_name="Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors", 
             cache_dir=MODELS_DIR, 
             local_files_only=True
         )
-        pipe_edit.fuse_lora()
-        current_lora_state = "lightning"
-    elif not is_lightning and current_lora_state == "lightning":
-        pipe_edit.unfuse_lora()
-        pipe_edit.unload_lora_weights()
-        current_lora_state = "none"
+    elif target_state == "lightning_8step":
+        pipe_edit.load_lora_weights(
+            "lightx2v/Qwen-Image-Lightning", 
+            weight_name="Qwen-Image-Lightning-8steps-V1.0-bf16.safetensors", 
+            cache_dir=MODELS_DIR, 
+            local_files_only=True
+        )
+        
+    current_lora_state = target_state
 
 def base64_to_pil(b64): return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
 def pil_to_base64(img):
@@ -213,6 +230,7 @@ def handler(job):
     if not images_b64: return {"error": "No image provided"}
     
     pil_images = [base64_to_pil(i) for i in images_b64]
+    
     for i in range(len(pil_images)):
         w, h = get_1mp_dimensions(pil_images[i].width, pil_images[i].height)
         pil_images[i] = pil_images[i].resize((w, h), Image.LANCZOS)
@@ -224,10 +242,20 @@ def handler(job):
     target_w, target_h = pil_images[0].size
     
     steps = job_input.get('num_inference_steps', 4)
-    use_lightning = job_input.get('use_lightning', True) and (steps <= 8)
-    manage_lora(use_lightning)
+    use_lightning = job_input.get('use_lightning', True)
     
-    default_cfg = 1.0 if use_lightning else 4.0
+    if use_lightning:
+        manage_lora(steps)
+    else:
+        manage_lora(999) 
+    
+    if current_lora_state == "lightning_4step":
+        default_cfg = 1.0
+    elif current_lora_state == "lightning_8step":
+        default_cfg = 2.5
+    else:
+        default_cfg = 4.0
+        
     cfg = float(job_input.get('true_guidance_scale', default_cfg))
 
     with torch.inference_mode():

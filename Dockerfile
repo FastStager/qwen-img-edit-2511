@@ -1,17 +1,14 @@
-FROM registry.hf.space/linoyts-qwen-image-edit-2511-fast:latest
+FROM nightfury172/qwen-edit-2511-runpod:latest
 
-RUN pip install --no-cache-dir runpod
-
-RUN mkdir -p /home/user/app/models
-ENV HF_HOME=/home/user/app/models
-
-RUN python3 -c "from huggingface_hub import snapshot_download; \
-    snapshot_download('Qwen/Qwen-Image-Edit-2511', cache_dir='/home/user/app/models'); \
-    snapshot_download('Qwen/Qwen3-VL-8B-Instruct', cache_dir='/home/user/app/models'); \
-    snapshot_download('lightx2v/Qwen-Image-Edit-2511-Lightning', allow_patterns=['*.safetensors'], cache_dir='/home/user/app/models');"
+RUN pip install --no-cache-dir torch==2.5.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
 COPY requirements.txt /home/user/app/requirements.txt
 RUN pip uninstall -y diffusers && pip install --no-cache-dir -r /home/user/app/requirements.txt
+
+RUN python3 -c "from huggingface_hub import snapshot_download; \
+    snapshot_download('Qwen/Qwen3-VL-8B-Instruct', cache_dir='/home/user/app/models'); \
+    snapshot_download('lightx2v/Qwen-Image-Edit-2511-Lightning', allow_patterns=['*.safetensors'], cache_dir='/home/user/app/models'); \
+    snapshot_download('lightx2v/Qwen-Image-Lightning', allow_patterns=['*8steps-V1.0*.safetensors'], cache_dir='/home/user/app/models');"
 
 COPY handler.py /home/user/app/handler.py
 
