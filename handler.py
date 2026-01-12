@@ -11,8 +11,13 @@ import gc
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 from diffusers import FlowMatchEulerDiscreteScheduler, QwenImageEditPlusPipeline
 
+# PATHS
 MODELS_DIR = "/home/user/app/models"
 BAKED_MODEL_PATH = "/home/user/app/models/baked_model"
+LORA_PATH = "/home/user/app/models/lora/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors"
+VL_MODEL_PATH = "/home/user/app/models/Qwen3-VL-8B-Instruct"
+
+# GLOBALS
 pipe_edit = None
 model_vl = None
 processor_vl = None
@@ -110,51 +115,62 @@ def get_1mp_dimensions(width, height):
     new_h = int(round(new_h / 64) * 64)
     return new_w, new_h
 
-def load_edit_model():
+def load_edit_model_globally():
     global pipe_edit
-    device, dtype = "cuda", torch.bfloat16
+    print("--- [STARTUP] Loading Diffusion Model ---")
+    
+    torch.backends.cuda.matmul.allow_tf32 = True 
+    torch.backends.cudnn.allow_tf32 = True
+    dtype = torch.bfloat16
     
     scheduler_config = {
-        "base_image_seq_len": 256, 
-        "base_shift": math.log(3), 
-        "invert_sigmas": False,
-        "max_image_seq_len": 8192, 
-        "max_shift": math.log(3), 
-        "num_train_timesteps": 1000,
-        "shift": 1.0, 
-        "shift_terminal": None, 
-        "stochastic_sampling": False,
-        "time_shift_type": "exponential", 
-        "use_beta_sigmas": False, 
-        "use_dynamic_shifting": True,
-        "use_exponential_sigmas": False, 
-        "use_karras_sigmas": False,
+        "base_image_seq_len": 256, "base_shift": math.log(3), "invert_sigmas": False,
+        "max_image_seq_len": 8192, "max_shift": math.log(3), "num_train_timesteps": 1000,
+        "shift": 1.0, "use_dynamic_shifting": True
     }
     scheduler = FlowMatchEulerDiscreteScheduler.from_config(scheduler_config)
-    
-    torch.backends.cuda.matmul.allow_tf32 = True
-    
+
+    # 1. LOAD BASE MODEL (Optimized I/O: Single File, mmap)
+    # We use low_cpu_mem_usage=True because the base model is CLEAN (no fused artifacts)
+    # This allows mmap streaming.
     pipe_edit = QwenImageEditPlusPipeline.from_pretrained(
         BAKED_MODEL_PATH, 
         scheduler=scheduler, 
         torch_dtype=dtype, 
         use_safetensors=True,
         local_files_only=True,
-        device_map="cuda"
-    )
+        low_cpu_mem_usage=True
+    ).to("cuda")
+
+    # 2. LOAD & FUSE LORA (Runtime)
+    # This ensures no weight corruption. It loads from local disk (fast) then fuses (GPU).
+    print("--- [STARTUP] Loading & Fusing LoRA ---")
+    pipe_edit.load_lora_weights(LORA_PATH, adapter_name="default")
+    pipe_edit.fuse_lora()
+    
+    # 3. WARMUP
+    print("--- [STARTUP] Warming up... ---")
+    with torch.inference_mode():
+        dummy_img = Image.new("RGB", (256, 256))
+        pipe_edit(image=[dummy_img], prompt="test", num_inference_steps=1)
+    
+    print("--- [STARTUP] Ready ---")
 
 def polish_prompt_local(original_prompt, pil_images):
-    device, dtype = "cuda", torch.bfloat16
-    try:
+    global model_vl, processor_vl
+    dtype = torch.bfloat16
+    
+    if model_vl is None:
+        print("--- Loading VL Model ---")
         model_vl = Qwen3VLForConditionalGeneration.from_pretrained(
-            "Qwen/Qwen3-VL-8B-Instruct", 
+            VL_MODEL_PATH, 
             torch_dtype=dtype, 
             device_map="auto", 
-            cache_dir=MODELS_DIR, 
             local_files_only=True
         )
-        processor_vl = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-8B-Instruct", cache_dir=MODELS_DIR)
+        processor_vl = AutoProcessor.from_pretrained(VL_MODEL_PATH, local_files_only=True)
 
+    try:
         content = [{"type": "text", "text": f"{SYSTEM_PROMPT}\n\nUser Input: {original_prompt}\n\nRewritten Prompt:"}]
         for img in pil_images:
             content.append({"type": "image", "image": img})
@@ -165,10 +181,6 @@ def polish_prompt_local(original_prompt, pil_images):
         generated_ids_trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
         output_text = processor_vl.batch_decode(generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         
-        del model_vl
-        del processor_vl
-        flush()
-
         if '"Rewritten"' in output_text:
             try:
                 start = output_text.find('{')
@@ -177,7 +189,8 @@ def polish_prompt_local(original_prompt, pil_images):
                 return res_json.get('Rewritten', original_prompt)
             except: pass
         return output_text.strip().replace("```json", "").replace("```", "").replace("\n", " ")
-    except Exception:
+    except Exception as e:
+        print(f"Rewriter Error: {e}")
         flush()
         return original_prompt
 
@@ -189,9 +202,9 @@ def pil_to_base64(img):
 
 def handler(job):
     global pipe_edit
-    if pipe_edit is None: load_edit_model()
+    if pipe_edit is None: load_edit_model_globally()
+    
     job_input = job.get('input', {})
-
     images_b64 = job_input.get('images', [])
     if not images_b64 and job_input.get('image'): images_b64 = [job_input.get('image')]
     if not images_b64: return {"error": "No image provided"}
@@ -235,5 +248,5 @@ def handler(job):
     }
 
 if __name__ == "__main__":
-    load_edit_model()
+    load_edit_model_globally()
     runpod.serverless.start({"handler": handler})
