@@ -1,9 +1,12 @@
 git+https://github.com/huggingface/diffusers.git
 transformers>=4.49.0
+torchvision
 accelerate
 safetensors
 sentencepiece
 peft
+protobuf
 runpod
 qwen_vl_utils
 huggingface_hub
+gradio

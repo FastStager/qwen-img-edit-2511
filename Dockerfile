@@ -11,7 +11,7 @@ RUN python3 -c "from huggingface_hub import snapshot_download; \
 
 COPY handler.py /home/user/app/handler.py
 
-RUN python3 -c "from transformers import Qwen3VLForConditionalGeneration; from diffusers import FlowMatchEulerDiscreteScheduler; print('Verified')"
+RUN python3 -c "from transformers import Qwen3VLForConditionalGeneration; from diffusers import FlowMatchEulerDiscreteScheduler, QwenImageEditPlusPipeline; print('Verified')"
 
 ENV PYTHONUNBUFFERED=1
 WORKDIR /home/user/app

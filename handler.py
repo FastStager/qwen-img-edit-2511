@@ -9,8 +9,7 @@ import json
 import os
 import gc
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
-from diffusers import FlowMatchEulerDiscreteScheduler
-from qwenimage.pipeline_qwenimage_edit_plus import QwenImageEditPlusPipeline
+from diffusers import FlowMatchEulerDiscreteScheduler, QwenImageEditPlusPipeline
 
 MODELS_DIR = "/home/user/app/models"
 pipe_edit = None
