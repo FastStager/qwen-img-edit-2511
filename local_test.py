@@ -134,7 +134,6 @@ def main():
         "Qwen/Qwen-Image-Edit-2511",
         scheduler=scheduler,
         torch_dtype=dtype,
-        low_cpu_mem_usage=True
     )
 
     print("Loading Lightning LoRA...")
@@ -147,9 +146,6 @@ def main():
         pipe.fuse_lora()
     except Exception as e:
         print(f"Fusion skipped (Low RAM): {e}")
-
-    print("Enabling CPU Offload...")
-    pipe.enable_model_cpu_offload()
 
     torch.cuda.synchronize()
     load_end_time = time.time()
