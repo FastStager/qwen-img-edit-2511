@@ -12,10 +12,10 @@ from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 from diffusers import FlowMatchEulerDiscreteScheduler, QwenImageEditPlusPipeline
 
 MODELS_DIR = "/home/user/app/models"
+BAKED_MODEL_PATH = "/home/user/app/models/baked_model"
 pipe_edit = None
 model_vl = None
 processor_vl = None
-current_lora_state = "none"
 
 SYSTEM_PROMPT = '''
 # Edit Instruction Rewriter
@@ -111,7 +111,7 @@ def get_1mp_dimensions(width, height):
     return new_w, new_h
 
 def load_edit_model():
-    global pipe_edit, current_lora_state
+    global pipe_edit
     device, dtype = "cuda", torch.bfloat16
     
     scheduler_config = {
@@ -131,16 +131,17 @@ def load_edit_model():
         "use_karras_sigmas": False,
     }
     scheduler = FlowMatchEulerDiscreteScheduler.from_config(scheduler_config)
-
+    
+    torch.backends.cuda.matmul.allow_tf32 = True
+    
     pipe_edit = QwenImageEditPlusPipeline.from_pretrained(
-        "Qwen/Qwen-Image-Edit-2511", 
+        BAKED_MODEL_PATH, 
         scheduler=scheduler, 
         torch_dtype=dtype, 
-        cache_dir=MODELS_DIR, 
-        local_files_only=True
-    ).to(device)
-    
-    current_lora_state = "none"
+        use_safetensors=True,
+        local_files_only=True,
+        device_map="cuda"
+    )
 
 def polish_prompt_local(original_prompt, pil_images):
     device, dtype = "cuda", torch.bfloat16
@@ -180,23 +181,6 @@ def polish_prompt_local(original_prompt, pil_images):
         flush()
         return original_prompt
 
-def manage_lora(is_lightning):
-    global pipe_edit, current_lora_state
-    
-    if is_lightning and current_lora_state != "lightning":
-        pipe_edit.load_lora_weights(
-            "lightx2v/Qwen-Image-Edit-2511-Lightning", 
-            weight_name="Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors", 
-            cache_dir=MODELS_DIR, 
-            local_files_only=True
-        )
-        pipe_edit.fuse_lora()
-        current_lora_state = "lightning"
-    elif not is_lightning and current_lora_state == "lightning":
-        pipe_edit.unfuse_lora()
-        pipe_edit.unload_lora_weights()
-        current_lora_state = "none"
-
 def base64_to_pil(b64): return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
 def pil_to_base64(img):
     buf = io.BytesIO()
@@ -227,11 +211,7 @@ def handler(job):
         prompt = polish_prompt_local(prompt, pil_images)
     
     steps = job_input.get('num_inference_steps', 4)
-    use_lightning = job_input.get('use_lightning', True) and (steps <= 8)
-    manage_lora(use_lightning)
-    
-    default_cfg = 1.0 if use_lightning else 4.0
-    cfg = float(job_input.get('true_guidance_scale', default_cfg))
+    cfg = float(job_input.get('true_guidance_scale', 1.0))
 
     batch_prompts = [prompt] * len(pil_images)
 
@@ -251,9 +231,9 @@ def handler(job):
     return {
         "images": [pil_to_base64(img) for img in output], 
         "seed": job_input.get('seed', 42), 
-        "rewritten_prompt": prompt if job_input.get('rewrite_prompt', False) else None,
-        "mode": current_lora_state
+        "rewritten_prompt": prompt if job_input.get('rewrite_prompt', False) else None
     }
 
 if __name__ == "__main__":
+    load_edit_model()
     runpod.serverless.start({"handler": handler})
