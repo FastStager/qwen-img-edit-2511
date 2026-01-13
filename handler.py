@@ -1,10 +1,12 @@
 import runpod
 import torch
+import numpy as np
 from PIL import Image
 import base64
 import io
 import math
 import json
+import os
 import gc
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 from diffusers import FlowMatchEulerDiscreteScheduler, QwenImageEditPlusPipeline
@@ -222,34 +224,24 @@ def handler(job):
     cfg = float(job_input.get('true_guidance_scale', 1.0))
     seed = job_input.get('seed', 42)
 
-    all_outputs = []
-    MICRO_BATCH_SIZE = 4
-    
-    batch_prompts_full = [prompt] * len(pil_images)
-    batch_neg_full = [job_input.get('negative_prompt', " ")] * len(pil_images)
+    batch_prompts = [prompt] * len(pil_images)
+    batch_negative = [job_input.get('negative_prompt', " ")] * len(pil_images)
 
     with torch.inference_mode():
-        for i in range(0, len(pil_images), MICRO_BATCH_SIZE):
-            chunk_imgs = pil_images[i : i + MICRO_BATCH_SIZE]
-            chunk_prompts = batch_prompts_full[i : i + MICRO_BATCH_SIZE]
-            chunk_neg = batch_neg_full[i : i + MICRO_BATCH_SIZE]
-            
-            chunk_output = pipe_edit(
-                image=chunk_imgs,
-                prompt=chunk_prompts,
-                negative_prompt=chunk_neg,
-                num_inference_steps=steps,
-                true_cfg_scale=cfg,
-                guidance_scale=cfg,
-                generator=torch.Generator("cuda").manual_seed(seed),
-                height=target_h,
-                width=target_w
-            ).images
-            
-            all_outputs.extend(chunk_output)
+        output = pipe_edit(
+            image=pil_images,
+            prompt=batch_prompts,
+            negative_prompt=batch_negative,
+            num_inference_steps=steps,
+            true_cfg_scale=cfg,
+            guidance_scale=cfg,
+            generator=torch.Generator("cuda").manual_seed(seed),
+            height=target_h,
+            width=target_w
+        ).images
         
     return {
-        "images": [pil_to_base64(img) for img in all_outputs], 
+        "images": [pil_to_base64(img) for img in output], 
         "seed": seed, 
         "rewritten_prompt": prompt if job_input.get('rewrite_prompt', False) else None
     }
