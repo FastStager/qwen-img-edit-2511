@@ -1,13 +1,11 @@
 import runpod
 import torch
-import numpy as np
 from PIL import Image
 import base64
 import io
 import math
 import gc
 from diffusers import FlowMatchEulerDiscreteScheduler, QwenImageEditPlusPipeline
-
 
 import rewriter
 
@@ -18,6 +16,7 @@ ANGLES_LORA = "qwen-image-edit-2511-multiple-angles-lora.safetensors"
 
 pipe = None
 
+# --- Camera Mapping Constants ---
 AZIMUTH_MAP = {
     0: "front view", 45: "front-right quarter view", 90: "right side view",
     135: "back-right quarter view", 180: "back view", 225: "back-left quarter view",
@@ -61,11 +60,24 @@ def load_edit_model():
     print("--- Loading Edit Model & Adapters ---")
     dtype = torch.bfloat16
     
-    scheduler = FlowMatchEulerDiscreteScheduler.from_config({
-        "base_image_seq_len": 256, "base_shift": math.log(3), "invert_sigmas": False,
-        "max_image_seq_len": 8192, "max_shift": math.log(3), "num_train_timesteps": 1000,
-        "shift": 1.0, "use_dynamic_shifting": True
-    })
+    scheduler_config = {
+        "base_image_seq_len": 256, 
+        "base_shift": math.log(3), 
+        "invert_sigmas": False,
+        "max_image_seq_len": 8192, 
+        "max_shift": math.log(3), 
+        "num_train_timesteps": 1000,
+        "shift": 1.0, 
+        "shift_terminal": None, 
+        "stochastic_sampling": False,
+        "time_shift_type": "exponential", 
+        "use_beta_sigmas": False, 
+        "use_dynamic_shifting": True,
+        "use_exponential_sigmas": False, 
+        "use_karras_sigmas": False,
+    }
+    
+    scheduler = FlowMatchEulerDiscreteScheduler.from_config(scheduler_config)
 
     pipe = QwenImageEditPlusPipeline.from_pretrained(
         BAKED_MODEL_PATH,

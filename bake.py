@@ -18,9 +18,20 @@ def bake():
 
     print("--- [BAKE] Loading Base Edit Model... ---")
     scheduler_config = {
-        "base_image_seq_len": 256, "base_shift": math.log(3), "invert_sigmas": False,
-        "max_image_seq_len": 8192, "max_shift": math.log(3), "num_train_timesteps": 1000,
-        "shift": 1.0, "use_dynamic_shifting": True
+        "base_image_seq_len": 256, 
+        "base_shift": math.log(3), 
+        "invert_sigmas": False,
+        "max_image_seq_len": 8192, 
+        "max_shift": math.log(3), 
+        "num_train_timesteps": 1000,
+        "shift": 1.0, 
+        "shift_terminal": None, 
+        "stochastic_sampling": False,
+        "time_shift_type": "exponential", 
+        "use_beta_sigmas": False, 
+        "use_dynamic_shifting": True,
+        "use_exponential_sigmas": False, 
+        "use_karras_sigmas": False,
     }
     scheduler = FlowMatchEulerDiscreteScheduler.from_config(scheduler_config)
 
