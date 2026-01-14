@@ -5,247 +5,192 @@ from PIL import Image
 import base64
 import io
 import math
-import json
-import os
 import gc
-from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 from diffusers import FlowMatchEulerDiscreteScheduler, QwenImageEditPlusPipeline
 
-MODELS_DIR = "/home/user/app/models"
+
+import rewriter
+
 BAKED_MODEL_PATH = "/home/user/app/models/baked_model"
 LORA_DIR = "/home/user/app/models/lora"
-LORA_WEIGHT_NAME = "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors"
-VL_MODEL_PATH = "/home/user/app/models/Qwen3-VL-8B-Instruct"
+LIGHTNING_LORA = "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors"
+ANGLES_LORA = "qwen-image-edit-2511-multiple-angles-lora.safetensors"
 
-pipe_edit = None
-model_vl = None
-processor_vl = None
+pipe = None
 
-SYSTEM_PROMPT = '''
-# Edit Instruction Rewriter
-You are a professional edit instruction rewriter. Your task is to generate a precise, concise, and visually achievable professional-level edit instruction based on the user-provided instruction and the image to be edited.  
-
-Please strictly follow the rewriting rules below:
-
-## 1. General Principles
-- Keep the rewritten prompt **concise and comprehensive**. Avoid overly long sentences and unnecessary descriptive language.  
-- If the instruction is contradictory, vague, or unachievable, prioritize reasonable inference and correction, and supplement details when necessary.  
-- Keep the main part of the original instruction unchanged, only enhancing its clarity, rationality, and visual feasibility.  
-- All added objects or modifications must align with the logic and style of the scene in the input images.  
-- If multiple sub-images are to be generated, describe the content of each sub-image individually.  
-
-## 2. Task-Type Handling Rules
-
-### 1. Add, Delete, Replace Tasks
-- If the instruction is clear (already includes task type, target entity, position, quantity, attributes), preserve the original intent and only refine the grammar.  
-- If the description is vague, supplement with minimal but sufficient details (category, color, size, orientation, position, etc.). For example:  
-    > Original: "Add an animal"  
-    > Rewritten: "Add a light-gray cat in the bottom-right corner, sitting and facing the camera"  
-- Remove meaningless instructions: e.g., "Add 0 objects" should be ignored or flagged as invalid.  
-- For replacement tasks, specify "Replace Y with X" and briefly describe the key visual features of X.  
-
-### 2. Text Editing Tasks
-- All text content must be enclosed in English double quotes `" "`. Keep the original language of the text, and keep the capitalization.  
-- Both adding new text and replacing existing text are text replacement tasks, For example:  
-    - Replace "xx" to "yy"  
-    - Replace the mask / bounding box to "yy"  
-    - Replace the visual object to "yy"  
-- Specify text position, color, and layout only if user has required.  
-- If font is specified, keep the original language of the font.  
-
-### 3. Human Editing Tasks
-- Make the smallest changes to the given user's prompt.  
-- If changes to background, action, expression, camera shot, or ambient lighting are required, please list each modification individually.
-- **Edits to makeup or facial features / expression must be subtle, not exaggerated, and must preserve the subject's identity consistency.**
-    > Original: "Add eyebrows to the face"  
-    > Rewritten: "Slightly thicken the person's eyebrows with little change, look natural."
-
-### 4. Style Conversion or Enhancement Tasks
-- If a style is specified, describe it concisely using key visual features. For example:  
-    > Original: "Disco style"  
-    > Rewritten: "1970s disco style: flashing lights, disco ball, mirrored walls, vibrant colors"  
-- For style reference, analyze the original image and extract key characteristics (color, composition, texture, lighting, artistic style, etc.), integrating them into the instruction.  
-- **Colorization tasks (including old photo restoration) must use the fixed template:**  
-  "Restore and colorize the old photo."  
-- Clearly specify the object to be modified. For example:  
-    > Original: Modify the subject in Picture 1 to match the style of Picture 2.  
-    > Rewritten: Change the girl in Picture 1 to the ink-wash style of Picture 2 — rendered in black-and-white watercolor with soft color transitions.
-
-### 5. Material Replacement
-- Clearly specify the object and the material. For example: "Change the material of the apple to papercut style."
-- For text material replacement, use the fixed template:
-    "Change the material of text "xxxx" to laser style"
-
-### 6. Logo/Pattern Editing
-- Material replacement should preserve the original shape and structure as much as possible. For example:
-   > Original: "Convert to sapphire material"  
-   > Rewritten: "Convert the main subject in the image to sapphire material, preserving similar shape and structure"
-- When migrating logos/patterns to new scenes, ensure shape and structure consistency. For example:
-   > Original: "Migrate the logo in the image to a new scene"  
-   > Rewritten: "Migrate the logo in the image to a new scene, preserving similar shape and structure"
-
-### 7. Multi-Image Tasks
-- Rewritten prompts must clearly point out which image's element is being modified. For example:  
-    > Original: "Replace the subject of picture 1 with the subject of picture 2"  
-    > Rewritten: "Replace the girl of picture 1 with the boy of picture 2, keeping picture 2's background unchanged"  
-- For stylization tasks, describe the reference image's style in the rewritten prompt, while preserving the visual content of the source image.  
-
-## 3. Rationale and Logic Check
-- Resolve contradictory instructions: e.g., "Remove all trees but keep all trees" requires logical correction.
-- Supplement missing critical information: e.g., if position is unspecified, choose a reasonable area based on composition (near subject, blank space, center/edge, etc.).
-
-# Output Format Example
-```json
-{
-   "Rewritten": "..."
+AZIMUTH_MAP = {
+    0: "front view", 45: "front-right quarter view", 90: "right side view",
+    135: "back-right quarter view", 180: "back view", 225: "back-left quarter view",
+    270: "left side view", 315: "front-left quarter view"
 }
-'''
+ELEVATION_MAP = {
+    -30: "low-angle shot", 0: "eye-level shot", 
+    30: "elevated shot", 60: "high-angle shot"
+}
+DISTANCE_MAP = {
+    0.6: "close-up", 1.0: "medium shot", 1.4: "medium shot", 1.8: "wide shot"
+}
 
-def flush():
-    gc.collect()
-    torch.cuda.empty_cache()
+def snap_to_nearest(value, options):
+    return min(options, key=lambda x: abs(x - value))
 
-def get_1mp_dimensions(width, height):
-    target_area = 1024 * 1024
+def build_camera_prompt(azimuth, elevation, distance):
+    """Generates the <sks> trigger prompt for the Angle LoRA"""
+    if azimuth is None and elevation is None and distance is None:
+        return ""
+        
+    az = snap_to_nearest(float(azimuth or 0), list(AZIMUTH_MAP.keys()))
+    el = snap_to_nearest(float(elevation or 0), list(ELEVATION_MAP.keys()))
+    di = snap_to_nearest(float(distance or 1.0), list(DISTANCE_MAP.keys()))
+    return f"<sks> {AZIMUTH_MAP[az]} {ELEVATION_MAP[el]} {DISTANCE_MAP[di]}"
+
+def get_optimized_dimensions(width, height, max_size=1024):
     aspect = width / height
-    new_w = math.sqrt(target_area * aspect)
-    new_h = new_w / aspect
-    new_w = int(round(new_w / 64) * 64)
-    new_h = int(round(new_h / 64) * 64)
-    return new_w, new_h
+    if width > height:
+        new_w = min(width, max_size)
+        new_h = int(new_w / aspect)
+    else:
+        new_h = min(height, max_size)
+        new_w = int(new_h * aspect)
+    return (new_w // 16) * 16, (new_h // 16) * 16
 
-def load_edit_model_globally():
-    global pipe_edit
-    
-    torch.backends.cuda.matmul.allow_tf32 = True 
-    torch.backends.cudnn.allow_tf32 = True
+def load_edit_model():
+    global pipe
+    if pipe is not None: return
+
+    print("--- Loading Edit Model & Adapters ---")
     dtype = torch.bfloat16
     
-    scheduler_config = {
-        "base_image_seq_len": 256, 
-        "base_shift": math.log(3), 
-        "invert_sigmas": False,
-        "max_image_seq_len": 8192, 
-        "max_shift": math.log(3), 
-        "num_train_timesteps": 1000,
-        "shift": 1.0, 
-        "shift_terminal": None, 
-        "stochastic_sampling": False,
-        "time_shift_type": "exponential", 
-        "use_beta_sigmas": False, 
-        "use_dynamic_shifting": True,
-        "use_exponential_sigmas": False, 
-        "use_karras_sigmas": False,
-    }
-    scheduler = FlowMatchEulerDiscreteScheduler.from_config(scheduler_config)
+    scheduler = FlowMatchEulerDiscreteScheduler.from_config({
+        "base_image_seq_len": 256, "base_shift": math.log(3), "invert_sigmas": False,
+        "max_image_seq_len": 8192, "max_shift": math.log(3), "num_train_timesteps": 1000,
+        "shift": 1.0, "use_dynamic_shifting": True
+    })
 
-    pipe_edit = QwenImageEditPlusPipeline.from_pretrained(
-        BAKED_MODEL_PATH, 
-        scheduler=scheduler, 
-        torch_dtype=dtype, 
-        use_safetensors=True,
-        local_files_only=True,
-        low_cpu_mem_usage=True
+    pipe = QwenImageEditPlusPipeline.from_pretrained(
+        BAKED_MODEL_PATH,
+        scheduler=scheduler,
+        torch_dtype=dtype,
+        local_files_only=True
     ).to("cuda")
 
-    pipe_edit.load_lora_weights(LORA_DIR, weight_name=LORA_WEIGHT_NAME, adapter_name="default")
-    pipe_edit.fuse_lora()
+    pipe.load_lora_weights(
+        LORA_DIR, weight_name=LIGHTNING_LORA, adapter_name="lightning"
+    )
     
-    with torch.inference_mode():
-        dummy_img = Image.new("RGB", (256, 256))
-        pipe_edit(image=[dummy_img], prompt="test", num_inference_steps=1)
-
-def polish_prompt_local(original_prompt, pil_images):
-    global model_vl, processor_vl
-    dtype = torch.bfloat16
+    pipe.load_lora_weights(
+        LORA_DIR, weight_name=ANGLES_LORA, adapter_name="angles"
+    )
     
-    if model_vl is None:
-        model_vl = Qwen3VLForConditionalGeneration.from_pretrained(
-            VL_MODEL_PATH, 
-            torch_dtype=dtype, 
-            device_map="auto", 
-            local_files_only=True
-        )
-        processor_vl = AutoProcessor.from_pretrained(VL_MODEL_PATH, local_files_only=True)
+    pipe.set_adapters(["lightning", "angles"], adapter_weights=[1.0, 1.0])
+    print("--- Models Loaded ---")
 
-    try:
-        content = [{"type": "text", "text": f"{SYSTEM_PROMPT}\n\nUser Input: {original_prompt}\n\nRewritten Prompt:"}]
-        for img in pil_images:
-            content.append({"type": "image", "image": img})
+def base64_to_pil(b64): 
+    return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
 
-        messages = [{"role": "user", "content": content}]
-        inputs = processor_vl.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_dict=True, return_tensors="pt").to(model_vl.device)
-        generated_ids = model_vl.generate(**inputs, max_new_tokens=512)
-        generated_ids_trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
-        output_text = processor_vl.batch_decode(generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        
-        if '"Rewritten"' in output_text:
-            try:
-                start = output_text.find('{')
-                end = output_text.rfind('}') + 1
-                res_json = json.loads(output_text[start:end])
-                return res_json.get('Rewritten', original_prompt)
-            except: pass
-        return output_text.strip().replace("```json", "").replace("```", "").replace("\n", " ")
-    except Exception as e:
-        flush()
-        return original_prompt
-
-def base64_to_pil(b64): return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
 def pil_to_base64(img):
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=95)
+    img.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 def handler(job):
-    global pipe_edit
-    if pipe_edit is None: load_edit_model_globally()
+    global pipe
+    if pipe is None: load_edit_model()
     
     job_input = job.get('input', {})
-    images_b64 = job_input.get('images', [])
-    if not images_b64 and job_input.get('image'): images_b64 = [job_input.get('image')]
-    if not images_b64: return {"error": "No image provided"}
     
-    pil_images = [base64_to_pil(i) for i in images_b64]
-    
-    target_w, target_h = get_1mp_dimensions(pil_images[0].width, pil_images[0].height)
-    if job_input.get('height') and job_input.get('width'):
-        target_h = (int(job_input['height']) // 64) * 64
-        target_w = (int(job_input['width']) // 64) * 64
-
-    for i in range(len(pil_images)):
-        pil_images[i] = pil_images[i].resize((target_w, target_h), Image.LANCZOS)
-
-    prompt = job_input.get('prompt', "edit")
-    if job_input.get('rewrite_prompt', False):
-        prompt = polish_prompt_local(prompt, pil_images)
-    
-    steps = job_input.get('num_inference_steps', 4)
-    cfg = float(job_input.get('true_guidance_scale', 1.0))
-    seed = job_input.get('seed', 42)
-
-    batch_prompts = [prompt] * len(pil_images)
-    batch_negative = [job_input.get('negative_prompt', " ")] * len(pil_images)
-
-    with torch.inference_mode():
-        output = pipe_edit(
-            image=pil_images,
-            prompt=batch_prompts,
-            negative_prompt=batch_negative,
-            num_inference_steps=steps,
-            true_cfg_scale=cfg,
-            guidance_scale=cfg,
-            generator=torch.Generator("cuda").manual_seed(seed),
-            height=target_h,
-            width=target_w
-        ).images
+    images_in = job_input.get('images', [])
+    if not images_in and job_input.get('image'):
+        images_in = [job_input.get('image')]
         
+    if not images_in: return {"error": "No images provided"}
+    
+    try:
+        pil_images = [base64_to_pil(i) for i in images_in]
+    except Exception as e:
+        return {"error": f"Image decode failed: {str(e)}"}
+
+    raw_prompt = job_input.get('prompt', "")
+    do_rewrite = job_input.get('rewrite_prompt', False)
+    
+    cam_prompt = build_camera_prompt(
+        job_input.get('azimuth'),
+        job_input.get('elevation'),
+        job_input.get('distance')
+    )
+
+    prompts = []
+    rewritten_prompts_log = [] 
+    
+    is_batch = isinstance(raw_prompt, list)
+    
+    if is_batch:
+        if len(raw_prompt) != len(pil_images):
+            return {"error": "Batch mode: Prompt list length must match Images list length."}
+            
+        for idx, p in enumerate(raw_prompt):
+            final_p = p
+            if do_rewrite:
+                final_p = rewriter.polish_prompt(p, [pil_images[idx]])
+                rewritten_prompts_log.append(final_p)
+            
+            prompts.append(f"{cam_prompt} {final_p}".strip())
+    else:
+        final_p = raw_prompt
+        if do_rewrite:
+            final_p = rewriter.polish_prompt(raw_prompt, pil_images)
+            rewritten_prompts_log.append(final_p)
+            
+        prompts = [f"{cam_prompt} {final_p}".strip()]
+
+    w, h = get_optimized_dimensions(pil_images[0].width, pil_images[0].height, 
+                                    max_size=int(job_input.get('max_dim', 1024)))
+    proc_images = [img.resize((w, h), Image.LANCZOS) for img in pil_images]
+
+    seed = job_input.get('seed', 42)
+    steps = int(job_input.get('num_inference_steps', 4))
+    cfg = float(job_input.get('guidance_scale', 1.0))
+    generator = torch.Generator("cuda").manual_seed(seed)
+    
+    output_images = []
+    
+    try:
+        if is_batch:
+            result = pipe(
+                image=proc_images,
+                prompt=prompts,
+                num_inference_steps=steps,
+                guidance_scale=cfg,
+                generator=generator,
+                height=h,
+                width=w
+            ).images
+            output_images = result
+        else:
+            result = pipe(
+                image=proc_images, 
+                prompt=prompts[0], 
+                num_inference_steps=steps,
+                guidance_scale=cfg,
+                generator=generator,
+                height=h,
+                width=w
+            ).images
+            output_images = result
+
+    except Exception as e:
+        return {"error": f"Inference failed: {str(e)}"}
+    finally:
+        gc.collect()
+        torch.cuda.empty_cache()
+
     return {
-        "images": [pil_to_base64(img) for img in output], 
-        "seed": seed, 
-        "rewritten_prompt": prompt if job_input.get('rewrite_prompt', False) else None
+        "images": [pil_to_base64(img) for img in output_images],
+        "seed": seed,
+        "final_prompts": prompts,
+        "rewritten_log": rewritten_prompts_log if do_rewrite else None
     }
 
 if __name__ == "__main__":
-    load_edit_model_globally()
+    load_edit_model()
     runpod.serverless.start({"handler": handler})

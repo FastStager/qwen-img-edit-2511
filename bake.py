@@ -13,10 +13,10 @@ def bake():
     os.makedirs(LORA_DIR, exist_ok=True)
     os.makedirs(VL_DIR, exist_ok=True)
 
-    print("--- [BAKE] Downloading Qwen-VL... ---")
+    print("--- [BAKE] Downloading Qwen-VL (Rewriter) ... ---")
     snapshot_download("Qwen/Qwen3-VL-8B-Instruct", local_dir=VL_DIR)
 
-    print("--- [BAKE] Loading Base Model to optimize I/O... ---")
+    print("--- [BAKE] Loading Base Edit Model... ---")
     scheduler_config = {
         "base_image_seq_len": 256, "base_shift": math.log(3), "invert_sigmas": False,
         "max_image_seq_len": 8192, "max_shift": math.log(3), "num_train_timesteps": 1000,
@@ -30,13 +30,20 @@ def bake():
         torch_dtype=torch.bfloat16
     )
 
-    print("--- [BAKE] Saving Optimized Base Model (Single File)... ---")
+    print("--- [BAKE] Saving Optimized Base Model... ---")
     pipe.save_pretrained(BASE_MODEL_DIR, safe_serialization=True, max_shard_size="100GB")
 
-    print("--- [BAKE] Downloading LoRA (No Fuse)... ---")
+    print("--- [BAKE] Downloading Lightning LoRA... ---")
     hf_hub_download(
         repo_id="lightx2v/Qwen-Image-Edit-2511-Lightning",
         filename="Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors",
+        local_dir=LORA_DIR
+    )
+
+    print("--- [BAKE] Downloading Multi-Angle LoRA... ---")
+    hf_hub_download(
+        repo_id="fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA",
+        filename="qwen-image-edit-2511-multiple-angles-lora.safetensors",
         local_dir=LORA_DIR
     )
 
