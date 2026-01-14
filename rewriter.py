@@ -4,6 +4,7 @@ import gc
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 
 VL_MODEL_PATH = "/home/user/app/models/Qwen3-VL-8B-Instruct"
+
 model_vl = None
 processor_vl = None
 
@@ -87,28 +88,26 @@ Please strictly follow the rewriting rules below:
 }
 '''
 
-def load_rewriter_model():
+def ensure_model_loaded():
     global model_vl, processor_vl
-    if model_vl is not None:
-        return
-
-    print("--- Loading Qwen3-VL Rewriter ---")
-    dtype = torch.bfloat16
-    model_vl = Qwen3VLForConditionalGeneration.from_pretrained(
-        VL_MODEL_PATH, 
-        torch_dtype=dtype, 
-        device_map="auto", 
-        local_files_only=True
-    )
-    processor_vl = AutoProcessor.from_pretrained(VL_MODEL_PATH, local_files_only=True)
+    if model_vl is None:
+        dtype = torch.bfloat16
+        model_vl = Qwen3VLForConditionalGeneration.from_pretrained(
+            VL_MODEL_PATH, 
+            torch_dtype=dtype, 
+            device_map="cpu", 
+            local_files_only=True
+        )
+        processor_vl = AutoProcessor.from_pretrained(VL_MODEL_PATH, local_files_only=True)
 
 def polish_prompt(original_prompt, pil_images):
     global model_vl, processor_vl
     
-    if model_vl is None:
-        load_rewriter_model()
+    ensure_model_loaded()
 
     try:
+        model_vl = model_vl.to("cuda")
+        
         content = [{"type": "text", "text": f"{SYSTEM_PROMPT}\n\nUser Input: {original_prompt}\n\nRewritten Prompt:"}]
         for img in pil_images:
             content.append({"type": "image", "image": img})
@@ -117,7 +116,7 @@ def polish_prompt(original_prompt, pil_images):
         
         inputs = processor_vl.apply_chat_template(
             messages, tokenize=True, add_generation_prompt=True, return_dict=True, return_tensors="pt"
-        ).to(model_vl.device)
+        ).to("cuda")
         
         with torch.no_grad():
             generated_ids = model_vl.generate(**inputs, max_new_tokens=512)
@@ -133,11 +132,13 @@ def polish_prompt(original_prompt, pil_images):
                 return res_json.get('Rewritten', original_prompt)
             except:
                 pass
-        
         return output_text.strip().replace("```json", "").replace("```", "").replace("\n", " ")
 
     except Exception as e:
         print(f"Rewriter Error: {e}")
         return original_prompt
     finally:
+        if model_vl:
+            model_vl = model_vl.to("cpu")
         torch.cuda.empty_cache()
+        gc.collect()

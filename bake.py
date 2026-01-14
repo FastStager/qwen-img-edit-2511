@@ -29,10 +29,11 @@ def bake():
         "stochastic_sampling": False,
         "time_shift_type": "exponential", 
         "use_beta_sigmas": False, 
-        "use_dynamic_shifting": True,
+        "use_dynamic_shifting": True, 
         "use_exponential_sigmas": False, 
         "use_karras_sigmas": False,
     }
+    
     scheduler = FlowMatchEulerDiscreteScheduler.from_config(scheduler_config)
 
     pipe = QwenImageEditPlusPipeline.from_pretrained(
