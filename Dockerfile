@@ -14,10 +14,12 @@ RUN python3 bake.py && \
     rm -rf /root/.cache/huggingface && \
     rm bake.py
 
-COPY handler.py .
+COPY handler.py rewriter.py ./
 
 ENV PYTHONUNBUFFERED=1
-ENV HF_HUB_OFFLINE=1 
+ENV HF_HUB_OFFLINE=1
 ENV HF_DATASETS_OFFLINE=1
+# Lazy CUDA module loading — faster cold start init
+ENV CUDA_MODULE_LOADING=LAZY
 
 CMD ["python", "-u", "handler.py"]

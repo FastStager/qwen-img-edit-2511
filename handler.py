@@ -4,15 +4,15 @@ from PIL import Image
 import base64
 import io
 import math
-import gc
 from diffusers import FlowMatchEulerDiscreteScheduler, QwenImageEditPlusPipeline
 
 import rewriter
 
+# --- Global perf flags (free speedup on Ampere+ GPUs) ---
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 BAKED_MODEL_PATH = "/home/user/app/models/baked_model"
-LORA_DIR = "/home/user/app/models/lora"
-LIGHTNING_LORA = "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors"
-ANGLES_LORA = "qwen-image-edit-2511-multiple-angles-lora.safetensors"
 
 pipe = None
 
@@ -44,26 +44,26 @@ def load_edit_model():
     global pipe
     if pipe is not None: return
 
-    print("--- Loading Edit Model & Adapters ---")
+    print("--- Loading Fused Edit Model ---")
     dtype = torch.bfloat16
-    
+
     scheduler_config = {
-        "base_image_seq_len": 256, 
-        "base_shift": math.log(3), 
+        "base_image_seq_len": 256,
+        "base_shift": math.log(3),
         "invert_sigmas": False,
-        "max_image_seq_len": 8192, 
-        "max_shift": math.log(3), 
+        "max_image_seq_len": 8192,
+        "max_shift": math.log(3),
         "num_train_timesteps": 1000,
-        "shift": 1.0, 
-        "shift_terminal": None, 
+        "shift": 1.0,
+        "shift_terminal": None,
         "stochastic_sampling": False,
-        "time_shift_type": "exponential", 
-        "use_beta_sigmas": False, 
-        "use_dynamic_shifting": True, 
-        "use_exponential_sigmas": False, 
+        "time_shift_type": "exponential",
+        "use_beta_sigmas": False,
+        "use_dynamic_shifting": True,
+        "use_exponential_sigmas": False,
         "use_karras_sigmas": False,
     }
-    
+
     scheduler = FlowMatchEulerDiscreteScheduler.from_config(scheduler_config)
 
     pipe = QwenImageEditPlusPipeline.from_pretrained(
@@ -73,35 +73,55 @@ def load_edit_model():
         local_files_only=True
     ).to("cuda")
 
-    pipe.load_lora_weights(LORA_DIR, weight_name=LIGHTNING_LORA, adapter_name="lightning")
-    pipe.load_lora_weights(LORA_DIR, weight_name=ANGLES_LORA, adapter_name="angles")
-    pipe.set_adapters(["lightning", "angles"], adapter_weights=[1.0, 1.0])
-    
-    print("--- Models Loaded ---")
+    # LoRAs are already fused into weights at bake time — no loading needed
 
-def base64_to_pil(b64): 
+    # Fuse Q/K/V attention projections into a single matmul
+    try:
+        pipe.fuse_qkv_projections()
+        print("--- QKV projections fused ---")
+    except Exception as e:
+        print(f"--- QKV fusion not supported: {e} ---")
+
+    # Optimal memory layout for conv layers (VAE)
+    try:
+        pipe.vae.to(memory_format=torch.channels_last)
+        print("--- VAE channels_last enabled ---")
+    except Exception:
+        pass
+
+    # Warmup: prime CUDA kernels so first real request isn't slow
+    print("--- Warmup inference ---")
+    dummy = Image.new("RGB", (512, 512), (128, 128, 128))
+    with torch.no_grad():
+        pipe(image=[dummy], prompt="warmup", num_inference_steps=1, height=512, width=512)
+    del dummy
+    torch.cuda.empty_cache()
+
+    print("--- Model Ready ---")
+
+def base64_to_pil(b64):
     return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
 
-def pil_to_base64(img):
+def pil_to_base64(img, fmt="JPEG", quality=95):
     buf = io.BytesIO()
-    img.save(buf, format="PNG")
+    if fmt == "JPEG":
+        img.save(buf, format="JPEG", quality=quality)
+    else:
+        img.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 def handler(job):
-    gc.collect()
-    torch.cuda.empty_cache()
-    
     global pipe
     if pipe is None: load_edit_model()
-    
+
     job_input = job.get('input', {})
-    
+
     images_in = job_input.get('images', [])
     if not images_in and job_input.get('image'):
         images_in = [job_input.get('image')]
-        
+
     if not images_in: return {"error": "No images provided"}
-    
+
     try:
         pil_images = [base64_to_pil(i) for i in images_in]
     except Exception as e:
@@ -113,9 +133,9 @@ def handler(job):
 
     prompts = []
     rewritten_log = []
-    
+
     is_batch = isinstance(raw_prompt, list)
-    
+
     if is_batch:
         if len(raw_prompt) != len(pil_images):
             return {"error": "Batch prompt length mismatch"}
@@ -143,7 +163,11 @@ def handler(job):
     steps = int(job_input.get('num_inference_steps', 4))
     cfg = float(job_input.get('guidance_scale', 1.0))
     generator = torch.Generator("cuda").manual_seed(seed)
-    
+
+    # Output format: JPEG (fast, ~10x faster encoding) or PNG (lossless)
+    out_fmt = job_input.get('output_format', 'JPEG').upper()
+    out_quality = int(job_input.get('output_quality', 95))
+
     output_images = []
     try:
         with torch.no_grad():
@@ -160,11 +184,10 @@ def handler(job):
     except Exception as e:
         return {"error": f"Inference failed: {str(e)}"}
     finally:
-        gc.collect()
         torch.cuda.empty_cache()
 
     return {
-        "images": [pil_to_base64(img) for img in output_images],
+        "images": [pil_to_base64(img, fmt=out_fmt, quality=out_quality) for img in output_images],
         "seed": seed,
         "final_prompts": prompts,
         "rewritten_log": rewritten_log if do_rewrite else None
