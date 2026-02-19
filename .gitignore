@@ -1,0 +1,12 @@
+# macOS resource forks
+._*
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Python
+__pycache__/
+*.pyc
+
+# Output
+output_edit.png
