@@ -22,7 +22,7 @@ except ImportError:
 
 # --- Tier 3: torchao FP8 quantization ---
 try:
-    from torchao.quantization import quantize_, float8_dynamic_activation_float8_weight
+    from torchao.quantization import quantize_, float8_weight_only
     HAS_TORCHAO_FP8 = True
     print("--- torchao FP8 available ---")
 except ImportError:
@@ -130,7 +130,7 @@ def load_edit_model():
         try:
             cc = torch.cuda.get_device_capability()
             if cc[0] >= 8:  # Ampere (8.x), Ada (8.9), Hopper (9.0)
-                quantize_(pipe.transformer, float8_dynamic_activation_float8_weight())
+                quantize_(pipe.transformer, float8_weight_only())
                 print(f"--- FP8 quantization applied (compute capability {cc[0]}.{cc[1]}) ---")
             else:
                 print(f"--- FP8 skipped: GPU compute capability {cc[0]}.{cc[1]} < 8.0 ---")

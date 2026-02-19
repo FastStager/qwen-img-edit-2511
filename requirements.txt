@@ -7,7 +7,7 @@ sentencepiece
 peft
 protobuf
 runpod
-PyTurboJPEG
+PyTurboJPEG<2.0
 torchao==0.7.0
 qwen_vl_utils
 huggingface_hub
