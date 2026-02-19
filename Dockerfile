@@ -3,7 +3,7 @@ FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /home/user/app
 
-RUN apt-get update && apt-get install -y git libgl1-mesa-glx libglib2.0-0 libturbojpeg && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y git libgl1-mesa-glx libglib2.0-0 libvips-dev && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \

@@ -1,24 +1,16 @@
 import runpod
 import torch
+import numpy as np
 from PIL import Image
+import pyvips
 import base64
 import io
 import math
+import time
 from concurrent.futures import ThreadPoolExecutor
 from diffusers import FlowMatchEulerDiscreteScheduler, QwenImageEditPlusPipeline
-import torchvision.transforms.functional as TVF
 
 import rewriter
-
-# --- Tier 2: turbojpeg for fast image I/O ---
-try:
-    from turbojpeg import TurboJPEG
-    _tjpeg = TurboJPEG()
-    HAS_TURBOJPEG = True
-    print("--- turbojpeg available ---")
-except ImportError:
-    HAS_TURBOJPEG = False
-    print("--- turbojpeg not found, falling back to PIL ---")
 
 # --- Tier 3: torchao FP8 quantization ---
 try:
@@ -29,13 +21,13 @@ except ImportError:
     HAS_TORCHAO_FP8 = False
     print("--- torchao FP8 not found, skipping quantization ---")
 
-# Thread pool for parallel image decode + encode (Kestrel-style)
+# Thread pool for parallel image decode+resize / encode (Kestrel-style)
 _io_pool = ThreadPoolExecutor(max_workers=4)
 
 # --- Global perf flags (free speedup on Ampere+ GPUs) ---
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
-# --- Tier 3: force fast SDPA backends, disable slow math fallback ---
+# --- Force fast SDPA backends, disable slow math fallback ---
 torch.backends.cuda.enable_flash_sdp(True)
 torch.backends.cuda.enable_mem_efficient_sdp(True)
 torch.backends.cuda.enable_math_sdp(False)
@@ -67,6 +59,39 @@ def get_1mp_dimensions(width, height):
     new_w = int(round(new_w / 64) * 64)
     new_h = int(round(new_h / 64) * 64)
     return new_w, new_h
+
+# --- pyvips: decode + resize in one C pipeline, zero intermediate copies ---
+def vips_decode_resize(b64, target_w, target_h):
+    """base64 → vips decode → Lanczos resize → PIL (for pipe). All in C."""
+    raw = base64.b64decode(b64)
+    img = pyvips.Image.new_from_buffer(raw, "")
+    # Force 3-band sRGB (drop alpha if present)
+    if img.bands == 4:
+        img = img[:3]
+    if img.bands == 1:
+        img = img.bandjoin([img, img])
+    img = img.resize(target_w / img.width, vscale=target_h / img.height, kernel="lanczos3")
+    # vips → numpy → PIL (one copy, no intermediate files)
+    mem = img.write_to_memory()
+    arr = np.frombuffer(mem, dtype=np.uint8).reshape(img.height, img.width, img.bands)
+    return Image.fromarray(arr)
+
+def vips_decode_only(b64):
+    """base64 → vips decode → PIL (no resize). For getting original dimensions."""
+    raw = base64.b64decode(b64)
+    img = pyvips.Image.new_from_buffer(raw, "")
+    return img.width, img.height
+
+# --- pyvips: encode output PIL → JPEG/PNG → base64, skip PIL encoder ---
+def vips_encode_b64(pil_img, fmt="JPEG", quality=95):
+    """PIL → numpy → vips → encode → base64. Bypasses PIL's slow encoder."""
+    arr = np.asarray(pil_img)
+    vi = pyvips.Image.new_from_memory(arr.data, arr.shape[1], arr.shape[0], arr.shape[2], "uchar")
+    if fmt == "JPEG":
+        buf = vi.jpegsave_buffer(Q=quality)
+    else:
+        buf = vi.pngsave_buffer()
+    return base64.b64encode(buf).decode("utf-8")
 
 def load_edit_model():
     global pipe
@@ -117,7 +142,7 @@ def load_edit_model():
     except Exception:
         pass
 
-    # --- Tier 2: VAE tiling + slicing (reduces peak VRAM, enables larger batches) ---
+    # --- VAE tiling + slicing (reduces peak VRAM, enables larger batches) ---
     try:
         pipe.vae.enable_tiling()
         pipe.vae.enable_slicing()
@@ -125,15 +150,26 @@ def load_edit_model():
     except Exception:
         pass
 
-    # --- Tier 3: FP8 quantization on transformer (30-40% faster on Ada/Hopper GPUs) ---
+    # --- FP8 quantize: transformer + VAE + text encoder ---
     if HAS_TORCHAO_FP8:
         try:
             cc = torch.cuda.get_device_capability()
-            if cc[0] >= 8:  # Ampere (8.x), Ada (8.9), Hopper (9.0)
+            if cc[0] >= 8:
                 quantize_(pipe.transformer, float8_weight_only())
-                print(f"--- FP8 quantization applied (compute capability {cc[0]}.{cc[1]}) ---")
+                print(f"--- FP8: transformer quantized (cc {cc[0]}.{cc[1]}) ---")
+                try:
+                    quantize_(pipe.vae, float8_weight_only())
+                    print("--- FP8: VAE quantized ---")
+                except Exception as e:
+                    print(f"--- FP8: VAE quantization failed (non-fatal): {e} ---")
+                if hasattr(pipe, 'text_encoder'):
+                    try:
+                        quantize_(pipe.text_encoder, float8_weight_only())
+                        print("--- FP8: text_encoder quantized ---")
+                    except Exception as e:
+                        print(f"--- FP8: text_encoder quantization failed (non-fatal): {e} ---")
             else:
-                print(f"--- FP8 skipped: GPU compute capability {cc[0]}.{cc[1]} < 8.0 ---")
+                print(f"--- FP8 skipped: GPU cc {cc[0]}.{cc[1]} < 8.0 ---")
         except Exception as e:
             print(f"--- FP8 quantization failed: {e} ---")
 
@@ -147,33 +183,10 @@ def load_edit_model():
 
     print("--- Model Ready ---")
 
-def base64_to_pil(b64):
-    raw = base64.b64decode(b64)
-    if HAS_TURBOJPEG:
-        try:
-            import numpy as np
-            arr = _tjpeg.decode(raw)  # BGR numpy array
-            return Image.fromarray(arr[:, :, ::-1])  # BGR -> RGB
-        except Exception:
-            pass  # not JPEG or decode error, fall back to PIL
-    return Image.open(io.BytesIO(raw)).convert("RGB")
-
-def pil_to_base64(img, fmt="JPEG", quality=95):
-    if fmt == "JPEG" and HAS_TURBOJPEG:
-        import numpy as np
-        arr = np.array(img)[:, :, ::-1]  # RGB -> BGR
-        jpeg_bytes = _tjpeg.encode(arr, quality=quality)
-        return base64.b64encode(jpeg_bytes).decode("utf-8")
-    buf = io.BytesIO()
-    if fmt == "JPEG":
-        img.save(buf, format="JPEG", quality=quality)
-    else:
-        img.save(buf, format="PNG")
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
-
 def handler(job):
     global pipe
     if pipe is None: load_edit_model()
+    t0 = time.perf_counter()
 
     job_input = job.get('input', {})
 
@@ -183,14 +196,30 @@ def handler(job):
 
     if not images_in: return {"error": "No images provided"}
 
+    # Get target dimensions from first image (peek via vips, no full decode)
     try:
-        # Tier 2: parallel image decode via thread pool (Kestrel-style)
+        orig_w, orig_h = vips_decode_only(images_in[0])
+    except Exception as e:
+        return {"error": f"Image probe failed: {str(e)}"}
+
+    w, h = get_1mp_dimensions(orig_w, orig_h)
+    if job_input.get('height') and job_input.get('width'):
+        h = int(job_input['height'])
+        w = int(job_input['width'])
+
+    # --- pyvips: decode + resize in one shot, parallel for batch ---
+    try:
+        def _decode_resize(b64):
+            return vips_decode_resize(b64, w, h)
+
         if len(images_in) > 1:
-            pil_images = list(_io_pool.map(base64_to_pil, images_in))
+            pil_images = list(_io_pool.map(_decode_resize, images_in))
         else:
-            pil_images = [base64_to_pil(images_in[0])]
+            pil_images = [_decode_resize(images_in[0])]
     except Exception as e:
         return {"error": f"Image decode failed: {str(e)}"}
+
+    t_decode = time.perf_counter()
 
     raw_prompt = job_input.get('prompt', "")
     do_rewrite = job_input.get('rewrite_prompt', False)
@@ -217,40 +246,27 @@ def handler(job):
             rewritten_log.append(final_p)
         prompts = [f"{cam_prompt} {final_p}".strip()]
 
-    w, h = get_1mp_dimensions(pil_images[0].width, pil_images[0].height)
-    if job_input.get('height') and job_input.get('width'):
-        h = int(job_input['height'])
-        w = int(job_input['width'])
-
-    # --- Tier 3: GPU-side resize (skip PIL CPU LANCZOS) ---
-    proc_images = []
-    for img in pil_images:
-        t = TVF.to_tensor(img).unsqueeze(0).to("cuda")          # [1,3,H,W] on GPU
-        t = TVF.resize(t, [h, w], antialias=True).squeeze(0)    # [3,h,w] GPU resize
-        proc_images.append(TVF.to_pil_image(t.cpu()))            # back to PIL for pipe
-    del t
-
     seed = job_input.get('seed', 42)
     steps = int(job_input.get('num_inference_steps', 4))
     cfg = float(job_input.get('guidance_scale', 1.0))
     generator = torch.Generator("cuda").manual_seed(seed)
 
-    # Output format: JPEG (fast, ~10x faster encoding) or PNG (lossless)
     out_fmt = job_input.get('output_format', 'JPEG').upper()
     out_quality = int(job_input.get('output_quality', 95))
 
+    t_preprocess = time.perf_counter()
+
     output_images = []
     try:
-        # --- Tier 3: inference_mode > no_grad (disables more autograd tracking) ---
         with torch.inference_mode():
             if is_batch:
                 output_images = pipe(
-                    image=proc_images, prompt=prompts, num_inference_steps=steps,
+                    image=pil_images, prompt=prompts, num_inference_steps=steps,
                     guidance_scale=cfg, generator=generator, height=h, width=w
                 ).images
             else:
                 output_images = pipe(
-                    image=proc_images, prompt=prompts[0], num_inference_steps=steps,
+                    image=pil_images, prompt=prompts[0], num_inference_steps=steps,
                     guidance_scale=cfg, generator=generator, height=h, width=w
                 ).images
     except Exception as e:
@@ -258,14 +274,22 @@ def handler(job):
     finally:
         torch.cuda.empty_cache()
 
-    # --- Tier 3: parallel output encoding via thread pool ---
+    t_inference = time.perf_counter()
+
+    # --- pyvips: parallel output encoding, bypasses PIL encoder ---
     def _encode(img):
-        return pil_to_base64(img, fmt=out_fmt, quality=out_quality)
+        return vips_encode_b64(img, fmt=out_fmt, quality=out_quality)
 
     if len(output_images) > 1:
         encoded = list(_io_pool.map(_encode, output_images))
     else:
         encoded = [_encode(output_images[0])]
+
+    t_encode = time.perf_counter()
+
+    print(f"[TIMING] decode+resize={t_decode-t0:.3f}s prompt={t_preprocess-t_decode:.3f}s "
+          f"inference={t_inference-t_preprocess:.3f}s encode={t_encode-t_inference:.3f}s "
+          f"total={t_encode-t0:.3f}s")
 
     return {
         "images": encoded,
