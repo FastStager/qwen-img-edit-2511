@@ -1,0 +1,15 @@
+git+https://github.com/huggingface/diffusers.git
+transformers>=4.49.0
+torchvision
+accelerate
+safetensors
+sentencepiece
+peft
+protobuf
+runpod
+pyvips
+torchao==0.7.0
+qwen_vl_utils
+huggingface_hub
+torch-tensorrt
+tensorrt

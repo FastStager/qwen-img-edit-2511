@@ -1,0 +1,44 @@
+# ─── Stage 2: Build on Vast.ai pod where /workspace/models/ exists ───
+#
+# Build:
+#   cd /workspace
+#   docker build -f Dockerfile.trt -t YOUR_REGISTRY/qwen-edit-trt:latest .
+#   docker push YOUR_REGISTRY/qwen-edit-trt:latest
+#
+# The build context is /workspace/ so COPY can reach models/
+
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
+WORKDIR /home/user/app
+
+# System deps (git, libvips for pyvips)
+RUN apt-get update && \
+    apt-get install -y git libgl1-mesa-glx libglib2.0-0 libvips-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# Python deps
+COPY requirements_trt.txt ./requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# ─── Pre-baked models from network storage ───
+# Fused base model (VAE, text_encoder, tokenizer, scheduler, transformer weights)
+COPY models/baked_model/ /workspace/models/baked_model/
+# TRT-compiled transformer engine
+COPY models/trt_engine/ /workspace/models/trt_engine/
+# Rewriter model
+COPY models/Qwen3-VL-8B-Instruct/ /workspace/models/Qwen3-VL-8B-Instruct/
+
+# Handler code
+COPY handler_trt.py ./handler.py
+COPY rewriter.py ./
+
+ENV PYTHONUNBUFFERED=1
+ENV HF_HUB_OFFLINE=1
+ENV HF_DATASETS_OFFLINE=1
+ENV CUDA_MODULE_LOADING=LAZY
+# Models path matches COPY destinations above
+ENV MODELS_DIR=/workspace/models
+
+CMD ["python", "-u", "handler.py"]

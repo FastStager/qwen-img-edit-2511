@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:docs.pytorch.org)",
+      "WebFetch(domain:developer.nvidia.com)",
+      "WebFetch(domain:github.com)",
+      "Bash(chmod +x:*)"
+    ]
+  }
+}
