@@ -21,6 +21,37 @@ except ImportError:
     HAS_TORCHAO_FP8 = False
     print("--- torchao FP8 not found, skipping quantization ---")
 
+# FP8 dynamic activation (H100 tensor core compute)
+try:
+    from torchao.quantization import float8_dynamic_activation_float8_weight
+    HAS_FP8_DYNAMIC = True
+    print("--- torchao FP8 dynamic activation available ---")
+except ImportError:
+    HAS_FP8_DYNAMIC = False
+
+# --- Custom Triton kernels ---
+try:
+    from kernels.fused_adaln import patch_adaln_zero
+    HAS_FUSED_ADALN = True
+except ImportError:
+    HAS_FUSED_ADALN = False
+
+try:
+    from kernels.fused_groupnorm_silu import patch_vae_groupnorm_silu
+    HAS_FUSED_GROUPNORM = True
+except ImportError:
+    HAS_FUSED_GROUPNORM = False
+
+try:
+    from kernels.cuda_graph_runner import setup_cuda_graph
+    HAS_CUDA_GRAPH = True
+except ImportError:
+    HAS_CUDA_GRAPH = False
+
+# --- Config: FP8 dynamic activation (env var, default on) ---
+import os
+FP8_DYNAMIC_ENABLED = os.environ.get("FP8_DYNAMIC", "1") == "1"
+
 # Thread pool for parallel image decode+resize / encode (Kestrel-style)
 _io_pool = ThreadPoolExecutor(max_workers=4)
 
@@ -35,6 +66,7 @@ torch.backends.cuda.enable_math_sdp(False)
 BAKED_MODEL_PATH = "/home/user/app/models/baked_model"
 
 pipe = None
+cuda_graph_runner = None
 
 AZIMUTH_MAP = {0: "front view", 45: "front-right quarter view", 90: "right side view", 135: "back-right quarter view", 180: "back view", 225: "back-left quarter view", 270: "left side view", 315: "front-left quarter view"}
 ELEVATION_MAP = {-30: "low-angle shot", 0: "eye-level shot", 30: "elevated shot", 60: "high-angle shot"}
@@ -155,8 +187,23 @@ def load_edit_model():
         try:
             cc = torch.cuda.get_device_capability()
             if cc[0] >= 8:
-                quantize_(pipe.transformer, float8_weight_only())
-                print(f"--- FP8: transformer quantized (cc {cc[0]}.{cc[1]}) ---")
+                # Transformer: use FP8 dynamic activation (real tensor core compute) if available and enabled
+                if HAS_FP8_DYNAMIC and FP8_DYNAMIC_ENABLED and cc[0] >= 9:
+                    # FP8 dynamic activation — requires cc >= 9.0 (H100/H200)
+                    quantize_(pipe.transformer, float8_dynamic_activation_float8_weight())
+                    print(f"--- FP8: transformer quantized with DYNAMIC activation (cc {cc[0]}.{cc[1]}) ---")
+                elif HAS_FP8_DYNAMIC and FP8_DYNAMIC_ENABLED and cc[0] >= 8:
+                    # Try dynamic on Ampere (cc 8.x) — may work with emulation
+                    try:
+                        quantize_(pipe.transformer, float8_dynamic_activation_float8_weight())
+                        print(f"--- FP8: transformer quantized with dynamic activation (cc {cc[0]}.{cc[1]}) ---")
+                    except Exception:
+                        quantize_(pipe.transformer, float8_weight_only())
+                        print(f"--- FP8: transformer quantized weight-only (cc {cc[0]}.{cc[1]}, dynamic fallback) ---")
+                else:
+                    quantize_(pipe.transformer, float8_weight_only())
+                    print(f"--- FP8: transformer quantized weight-only (cc {cc[0]}.{cc[1]}) ---")
+                # VAE + text_encoder: always weight-only (conv layers don't benefit from dynamic)
                 try:
                     quantize_(pipe.vae, float8_weight_only())
                     print("--- FP8: VAE quantized ---")
@@ -172,6 +219,28 @@ def load_edit_model():
                 print(f"--- FP8 skipped: GPU cc {cc[0]}.{cc[1]} < 8.0 ---")
         except Exception as e:
             print(f"--- FP8 quantization failed: {e} ---")
+
+    # --- Custom Triton kernel patches ---
+    if HAS_FUSED_ADALN:
+        try:
+            patch_adaln_zero(pipe)
+        except Exception as e:
+            print(f"--- Fused AdaLN patch failed (non-fatal): {e} ---")
+
+    if HAS_FUSED_GROUPNORM:
+        try:
+            patch_vae_groupnorm_silu(pipe)
+        except Exception as e:
+            print(f"--- Fused GroupNorm patch failed (non-fatal): {e} ---")
+
+    # --- CUDA Graph capture for standard 1024x1024 ---
+    global cuda_graph_runner
+    if HAS_CUDA_GRAPH:
+        try:
+            cuda_graph_runner = setup_cuda_graph(pipe, height=1024, width=1024)
+        except Exception as e:
+            print(f"--- CUDA Graph setup failed (non-fatal): {e} ---")
+            cuda_graph_runner = None
 
     # Warmup: prime CUDA kernels so first real request isn't slow
     print("--- Warmup inference ---")
