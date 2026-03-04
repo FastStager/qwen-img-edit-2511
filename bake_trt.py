@@ -2,17 +2,20 @@
 Two-stage model preparation for Vast.ai H100 pod.
 
 Stage 1: Download base model + LoRAs + rewriter, fuse LoRAs
-Stage 2: Compile transformer to TensorRT engine (requires GPU)
+Stage 2: Warmup torch.compile with TensorRT backend (requires GPU)
 
 Usage:
-    python bake_trt.py                # Full pipeline (download + fuse + TRT)
+    python bake_trt.py                # Full pipeline (download + fuse + warmup)
     python bake_trt.py --download     # Stage 1 only (no GPU needed)
     python bake_trt.py --trt          # Stage 2 only (needs GPU, models already downloaded)
 
 Paths (Vast.ai network storage):
     /workspace/models/baked_model/          Fused LoRA model
-    /workspace/models/trt_engine/           Compiled TRT transformer
     /workspace/models/Qwen3-VL-8B-Instruct/ Rewriter model
+
+Note: torch.compile with TensorRT backend uses JIT compilation. The compiled
+graphs are cached automatically via torch's inductor cache. Stage 2 warms up
+the cache so handler startup is fast.
 """
 
 import torch

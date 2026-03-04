@@ -14,6 +14,7 @@ RUN python3 bake.py && \
     rm -rf /root/.cache/huggingface && \
     rm bake.py
 
+COPY kernels/ kernels/
 COPY handler.py rewriter.py ./
 
 ENV PYTHONUNBUFFERED=1
@@ -21,5 +22,9 @@ ENV HF_HUB_OFFLINE=1
 ENV HF_DATASETS_OFFLINE=1
 # Lazy CUDA module loading — faster cold start init
 ENV CUDA_MODULE_LOADING=LAZY
+# Triton AOT cache (pre-populated at build time or first run)
+ENV TRITON_CACHE_DIR=/home/user/app/.triton_cache
+# FP8 dynamic activation quantization (set to 0 for weight-only / higher quality)
+ENV FP8_DYNAMIC=1
 
 CMD ["python", "-u", "handler.py"]
